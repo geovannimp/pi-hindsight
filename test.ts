@@ -897,7 +897,7 @@ describe("Retain async_retain config", () => {
 
 // ─── inferProjectMission tests ────────────────────────────────────────────────
 
-import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as pathJoin, basename as pathBasename } from "node:path";
 
@@ -1414,6 +1414,71 @@ describe("readRecentLogErrors", () => {
 // installed. Skipped on a fresh checkout without node_modules so that
 // `node --experimental-strip-types test.ts` still runs.
 const extensionDepsInstalled = existsSync("node_modules/@sinclair/typebox");
+
+// ─── pi agent dir config (~/.pi/agent/.hindsight/config) ─────────────────────
+// Runs before the applyEnvOverrides suite, which replaces process.env wholesale.
+
+describe("pi agent dir config", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
+  const originalEnv = { ...process.env };
+  let getConfig: () => any;
+
+  before(async () => {
+    ({ getConfig } = await import("./index.ts"));
+  });
+
+  function loadWith(home: string, agent: string) {
+    process.env.HOME = home;
+    process.env.PI_CODING_AGENT_DIR = agent;
+    try {
+      return getConfig();
+    } finally {
+      process.env.HOME = originalEnv.HOME;
+      if (originalEnv.PI_CODING_AGENT_DIR === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = originalEnv.PI_CODING_AGENT_DIR;
+    }
+  }
+
+  test("reads <agent dir>/.hindsight/config when ~/.hindsight/config is absent", () => {
+    const root = mkdtempSync(pathJoin(tmpdir(), "hindsight-agent-"));
+    const home = pathJoin(root, "home");
+    const agent = pathJoin(root, "agent");
+    mkdirSync(pathJoin(agent, ".hindsight"), { recursive: true });
+    writeFileSync(pathJoin(agent, ".hindsight", "config"), 'api_url = "http://agent"\napi_key = "agent-key"\n');
+    try {
+      const cfg = loadWith(home, agent);
+      assert.equal(cfg?.api_url, "http://agent");
+      assert.equal(cfg?.api_key, "agent-key");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("~/.hindsight/config wins per key over the agent config", () => {
+    const root = mkdtempSync(pathJoin(tmpdir(), "hindsight-agent-"));
+    const home = pathJoin(root, "home");
+    const agent = pathJoin(root, "agent");
+    mkdirSync(pathJoin(home, ".hindsight"), { recursive: true });
+    mkdirSync(pathJoin(agent, ".hindsight"), { recursive: true });
+    writeFileSync(pathJoin(home, ".hindsight", "config"), 'api_url = "http://legacy"\napi_key = "legacy-key"\n');
+    writeFileSync(pathJoin(agent, ".hindsight", "config"), 'api_url = "http://agent"\nglobal_bank = "synced"\n');
+    try {
+      const cfg = loadWith(home, agent);
+      assert.equal(cfg?.api_url, "http://legacy");
+      assert.equal(cfg?.global_bank, "synced");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("returns null when neither user-level file exists", () => {
+    const root = mkdtempSync(pathJoin(tmpdir(), "hindsight-agent-"));
+    try {
+      assert.equal(loadWith(pathJoin(root, "home"), pathJoin(root, "agent")), null);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("applyEnvOverrides", { skip: !extensionDepsInstalled && "extension deps not installed (run npm ci)" }, () => {
   const originalEnv = { ...process.env };
