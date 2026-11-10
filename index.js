@@ -4,7 +4,7 @@
  */
 import { Text } from "@mariozechner/pi-tui";
 import { existsSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, basename, dirname } from "node:path";
+import { join, basename, dirname, resolve } from "node:path";
 import { homedir, userInfo } from "node:os";
 import { execFileSync } from "node:child_process";
 import { Type } from "@sinclair/typebox";
@@ -70,16 +70,31 @@ export function resolveApiKey(global, local, env = process.env) {
         return local.api_key;
     return local.api_key || global.api_key || env.HINDSIGHT_API_KEY || readKeychainApiKey();
 }
-function getConfig() {
+function piAgentDir() {
+    const value = process.env.PI_CODING_AGENT_DIR?.trim();
+    if (!value)
+        return join(homedir(), ".pi", "agent");
+    if (value === "~")
+        return homedir();
+    if (value.startsWith("~/"))
+        return join(homedir(), value.slice(2));
+    return resolve(value);
+}
+function piAgentConfigPath() {
+    return join(piAgentDir(), ".hindsight", "config");
+}
+export function getConfig() {
     try {
+        const agentCfgPath = piAgentConfigPath();
         const globalCfgPath = join(homedir(), ".hindsight", "config");
-        if (!existsSync(globalCfgPath))
+        if (!existsSync(globalCfgPath) && !existsSync(agentCfgPath))
             return null;
-        const global = parseConfigFile(globalCfgPath);
+        const agent = existsSync(agentCfgPath) ? parseConfigFile(agentCfgPath) : {};
+        const global = existsSync(globalCfgPath) ? parseConfigFile(globalCfgPath) : {};
         // Project-level override: .hindsight/config in CWD
         const localCfgPath = join(sessionCwd, ".hindsight", "config");
         const local = existsSync(localCfgPath) ? parseConfigFile(localCfgPath) : {};
-        const merged = applyAliases({ ...global, ...local });
+        const merged = applyAliases({ ...agent, ...global, ...local });
         applyEnvOverrides(merged);
         const recallTypesRaw = merged.recall_types;
         const recall_types = recallTypesRaw
@@ -100,7 +115,7 @@ function getConfig() {
         const observation_scopes = merged.observation_scopes?.trim() || undefined;
         return {
             api_url: merged.api_url,
-            api_key: resolveApiKey(global, local),
+            api_key: resolveApiKey({ ...agent, ...global }, local),
             global_bank: merged.global_bank,
             project_bank_id: merged.project_bank_id,
             recall_types,
@@ -158,7 +173,7 @@ function detectLegacyKeys() {
     const globalCfgPath = join(homedir(), ".hindsight", "config");
     const localCfgPath = join(sessionCwd, ".hindsight", "config");
     const isHomeDir = sessionCwd === homedir();
-    const files = [globalCfgPath];
+    const files = [piAgentConfigPath(), globalCfgPath];
     if (!isHomeDir && existsSync(localCfgPath))
         files.push(localCfgPath);
     for (const file of files) {
@@ -196,16 +211,18 @@ function migrateConfigFile(filePath) {
     return migrated;
 }
 function getConfigWithSource() {
+    const agentCfgPath = piAgentConfigPath();
     const globalCfgPath = join(homedir(), ".hindsight", "config");
     const localCfgPath = join(sessionCwd, ".hindsight", "config");
     const isHomeDir = sessionCwd === homedir();
+    const piAgent = applyAliases(existsSync(agentCfgPath) ? parseConfigFile(agentCfgPath) : {});
     const globalRaw = existsSync(globalCfgPath) ? parseConfigFile(globalCfgPath) : {};
     const localRaw = (!isHomeDir && existsSync(localCfgPath)) ? parseConfigFile(localCfgPath) : {};
     const global = applyAliases(globalRaw);
     const local = applyAliases(localRaw);
-    const merged = { ...global, ...local };
+    const merged = { ...piAgent, ...global, ...local };
     applyEnvOverrides(merged); // reflect env overrides in the /hindsight settings view
-    return { global, local, merged, isHomeDir };
+    return { piAgent, global, local, merged, isHomeDir };
 }
 // ---------------------------------------------------------------------------
 // Environment variable overrides (omp-compatible bank contract)
@@ -1142,7 +1159,7 @@ export default function hindsightExtension(pi) {
         handler: async (args, ctx) => {
             const config = getConfig();
             if (!config) {
-                ctx.ui.notify("Hindsight config not found. Create ~/.hindsight/config", "error");
+                ctx.ui.notify(`Hindsight config not found. Create ${join(homedir(), ".hindsight", "config")} or ${piAgentConfigPath()}`, "error");
                 return;
             }
             const argsStr = (typeof args === "string" ? args : "").trim();
@@ -1217,6 +1234,7 @@ export default function hindsightExtension(pi) {
             if (argsStr === "settings") {
                 const globalCfgPath = join(homedir(), ".hindsight", "config");
                 const localCfgPath = join(sessionCwd, ".hindsight", "config");
+                const agentCfgPath = piAgentConfigPath();
                 let cfg = getConfigWithSource();
                 const isHomeDir = cfg.isHomeDir;
                 const settingsMeta = [
@@ -1237,10 +1255,13 @@ export default function hindsightExtension(pi) {
                 const buildOptions = () => {
                     const options = [];
                     if (isHomeDir)
-                        options.push("⚠ CWD is home dir - all saves go to global config");
+                        options.push("⚠ CWD is home dir - all saves go to the user-level config");
                     for (const s of settingsMeta) {
                         const val = cfg.merged[s.key] ?? s.default;
-                        const src = cfg.local[s.key] !== undefined ? "project" : cfg.global[s.key] !== undefined ? "global" : "default";
+                        const src = cfg.local[s.key] !== undefined ? "project"
+                            : cfg.global[s.key] !== undefined ? "global"
+                                : cfg.piAgent[s.key] !== undefined ? "pi-agent"
+                                    : "default";
                         options.push(`${s.label}: ${s.key === "api_key" && val !== s.default ? "****" : val} [${src}]`);
                     }
                     options.push(DONE_LABEL);
@@ -1276,19 +1297,35 @@ export default function hindsightExtension(pi) {
                         newValue = inputVal;
                     }
                     // Determine save target
-                    let saveGlobal = true;
+                    let saveGlobal = false;
                     let saveLocal = false;
+                    let saveAgent = false;
                     if (!isHomeDir) {
-                        const target = await ctx.ui.select(`Save ${selected.label} to:`, ["Project (.hindsight/config)", "Global (~/.hindsight/config)", "← Cancel"]);
+                        const target = await ctx.ui.select(`Save ${selected.label} to:`, [
+                            "Project (.hindsight/config)",
+                            "Global (~/.hindsight/config)",
+                            `Pi agent (${agentCfgPath})`,
+                            "← Cancel",
+                        ]);
                         if (!target || target === "← Cancel")
                             continue;
                         saveGlobal = target.startsWith("Global");
                         saveLocal = target.startsWith("Project");
+                        saveAgent = target.startsWith("Pi agent");
+                    }
+                    else if (existsSync(agentCfgPath) && !existsSync(globalCfgPath)) {
+                        // No project config in the home directory: keep editing the file that already exists.
+                        saveAgent = true;
+                    }
+                    else {
+                        saveGlobal = true;
                     }
                     if (saveGlobal)
                         writeConfigValue(globalCfgPath, selected.key, newValue);
                     if (saveLocal)
                         writeConfigValue(localCfgPath, selected.key, newValue);
+                    if (saveAgent)
+                        writeConfigValue(agentCfgPath, selected.key, newValue);
                     // Refresh merged view
                     cfg = getConfigWithSource();
                     ctx.ui.notify(`${selected.label} → ${selected.key === "api_key" ? "****" : newValue}`, "info");
